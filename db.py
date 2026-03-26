@@ -1,10 +1,8 @@
 """
 db.py — async PostgreSQL setup via SQLAlchemy + asyncpg
 """
-
 import os
 from datetime import datetime, timezone
-
 from dotenv import load_dotenv
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Integer,
@@ -13,37 +11,35 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-load_dotenv() 
+load_dotenv()
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+# Fix 1: .replace() returns a new string — must assign it back
+DATABASE_URL = os.environ["DATABASE_URL"].replace("postgresql://", "postgresql+asyncpg://")
 
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
+# Fix 2: Base must extend DeclarativeBase, not __DeclarativeBase__
 class Base(DeclarativeBase):
     pass
 
 
 # ── Tables ─────────────────────────────────────────────────────────────────────
 
-
-
-# ── Tables ─────────────────────────────────────────────────────────────────────
-
+# Fix 3: All models must extend Base, not __Base__
 class Device(Base):
     """Registered devices — one row per device_id."""
     __tablename__ = "devices"
 
-    device_id   = Column(String, primary_key=True)   # stable UUID from app
-    device_name = Column(String, nullable=False)
-    platform    = Column(String, nullable=False)      # android|ios|windows|macos|linux
-    push_token  = Column(String, nullable=True)       # FCM or APNs token
-    push_platform = Column(String, nullable=True)     # android|ios
-    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
-                         onupdate=lambda: datetime.now(timezone.utc))
+    device_id     = Column(String, primary_key=True)
+    device_name   = Column(String, nullable=False)
+    platform      = Column(String, nullable=False)
+    push_token    = Column(String, nullable=True)
+    push_platform = Column(String, nullable=True)
+    created_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
 
 
 class RoomMember(Base):
@@ -53,12 +49,12 @@ class RoomMember(Base):
     """
     __tablename__ = "room_members"
 
-    id          = Column(Integer, primary_key=True, autoincrement=True)
-    room_code   = Column(String(16), nullable=False, index=True)
-    device_id   = Column(String, nullable=False)
-    relay_host  = Column(String, nullable=True)
-    relay_port  = Column(Integer, nullable=True)
-    last_seen   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    room_code  = Column(String(16), nullable=False, index=True)
+    device_id  = Column(String, nullable=False)
+    relay_host = Column(String, nullable=True)
+    relay_port = Column(Integer, nullable=True)
+    last_seen  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class TransferRecord(Base):
@@ -67,7 +63,7 @@ class TransferRecord(Base):
 
     id          = Column(BigInteger, primary_key=True, autoincrement=True)
     session_id  = Column(String, nullable=False, index=True)
-    sender_id   = Column(String, nullable=True)   # device_id, if known
+    sender_id   = Column(String, nullable=True)
     receiver_id = Column(String, nullable=True)
     file_count  = Column(Integer, default=0)
     total_bytes = Column(BigInteger, default=0)
