@@ -202,22 +202,47 @@ class RelaySession:
         self.created_at = time.time()
         self.sender_ws: Optional[WebSocket] = None
         self.receiver_ws: Optional[WebSocket] = None
-        self._sender_ready = asyncio.Event()
-        self._receiver_ready = asyncio.Event()
-
-    async def wait_for_both(self, timeout=30):
-        await asyncio.wait_for(
-            asyncio.gather(self._sender_ready.wait(), self._receiver_ready.wait()),
-            timeout=timeout,
-        )
+        # Fired once both sides have attached — only the sender waits on this
+        self._both_ready = asyncio.Event()
+        # Fired when the pipe is fully done — receiver waits on this
+        self._pipe_done = asyncio.Event()
 
     def attach_sender(self, ws: WebSocket):
         self.sender_ws = ws
-        self._sender_ready.set()
+        self._check_ready()
 
     def attach_receiver(self, ws: WebSocket):
         self.receiver_ws = ws
-        self._receiver_ready.set()
+        self._check_ready()
+
+    def _check_ready(self):
+        if self.sender_ws is not None and self.receiver_ws is not None:
+            self._both_ready.set()
+
+    async def wait_until_ready(self, timeout: float = 60.0):
+        """Wait until both sides are connected. Raises asyncio.TimeoutError on timeout."""
+        await asyncio.wait_for(self._both_ready.wait(), timeout=timeout)
+
+    async def run_pipe(self):
+        """Bidirectional byte pipe. Called once by the sender after both sides ready."""
+        async def pipe(src: WebSocket, dst: WebSocket):
+            try:
+                while True:
+                    data = await src.receive_bytes()
+                    await dst.send_bytes(data)
+            except (WebSocketDisconnect, Exception):
+                pass
+
+        await asyncio.gather(
+            pipe(self.sender_ws, self.receiver_ws),
+            pipe(self.receiver_ws, self.sender_ws),
+            return_exceptions=True,
+        )
+        self._pipe_done.set()
+
+    async def wait_until_done(self):
+        """Wait for the pipe to finish. Called by the receiver."""
+        await self._pipe_done.wait()
 
 
 @app.post("/relay/session", summary="Create a relay session")
@@ -243,42 +268,38 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
     if role == "sender":
         session.attach_sender(websocket)
-    else:
+
+        # Sender owns the pipe: wait for receiver to connect, then run the pipe
+        try:
+            await session.wait_until_ready(timeout=60.0)
+        except asyncio.TimeoutError:
+            await websocket.close(code=4008)
+            _relay_sessions.pop(session_id, None)
+            return
+
+        await session.run_pipe()
+
+        # Mark complete in DB
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(
+                select(TransferRecord).where(TransferRecord.session_id == session_id)
+            )
+            record = result.scalar_one_or_none()
+            if record:
+                record.success = True
+                record.ended_at = datetime.now(timezone.utc)
+            await s.commit()
+
+        _relay_sessions.pop(session_id, None)
+
+    else:  # receiver
         session.attach_receiver(websocket)
 
-    try:
-        await session.wait_for_both(timeout=30)
-    except asyncio.TimeoutError:
-        await websocket.close(code=4008)
-        _relay_sessions.pop(session_id, None)
-        return
-
-    async def pipe(src: WebSocket, dst: WebSocket):
+        # Receiver just waits for the pipe to finish (sender drives it)
         try:
-            while True:
-                data = await src.receive_bytes()
-                await dst.send_bytes(data)
-        except (WebSocketDisconnect, Exception):
+            await session.wait_until_done()
+        except Exception:
             pass
-
-    await asyncio.gather(
-        pipe(session.sender_ws, session.receiver_ws),
-        pipe(session.receiver_ws, session.sender_ws),
-        return_exceptions=True,
-    )
-
-    # Mark complete in DB
-    async with AsyncSessionLocal() as s:
-        result = await s.execute(
-            select(TransferRecord).where(TransferRecord.session_id == session_id)
-        )
-        record = result.scalar_one_or_none()
-        if record:
-            record.success = True
-            record.ended_at = datetime.now(timezone.utc)
-        await s.commit()
-
-    _relay_sessions.pop(session_id, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
