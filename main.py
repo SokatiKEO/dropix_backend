@@ -240,9 +240,9 @@ class RelaySession:
         )
         self._pipe_done.set()
 
-    async def wait_until_done(self):
+    async def wait_until_done(self, timeout: float = 360.0):
         """Wait for the pipe to finish. Called by the receiver."""
-        await self._pipe_done.wait()
+        await asyncio.wait_for(self._pipe_done.wait(), timeout=timeout)
 
 
 @app.post("/relay/session", summary="Create a relay session")
@@ -271,7 +271,7 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
         # Sender owns the pipe: wait for receiver to connect, then run the pipe
         try:
-            await session.wait_until_ready(timeout=60.0)
+            await session.wait_until_ready(timeout=300.0)
         except asyncio.TimeoutError:
             await websocket.close(code=4008)
             _relay_sessions.pop(session_id, None)
@@ -297,7 +297,9 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
         # Receiver just waits for the pipe to finish (sender drives it)
         try:
-            await session.wait_until_done()
+            await session.wait_until_done(timeout=360.0)
+        except asyncio.TimeoutError:
+            await websocket.close(code=4008)  # Session expired
         except Exception:
             pass
 
