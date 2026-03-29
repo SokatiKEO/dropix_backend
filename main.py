@@ -223,25 +223,28 @@ class RelaySession:
 
     def _check_ready(self):
         if self.sender_ws is not None and self.receiver_ws is not None:
+            print(f"[SESSION {self.session_id}] BOTH CONNECTED")
             self._both_ready.set()
 
     async def wait_until_ready(self, timeout: float = 300.0):
         await asyncio.wait_for(self._both_ready.wait(), timeout=timeout)
 
     async def run_pipe(self):
-        async def pipe(src: WebSocket, dst: WebSocket):
+        async def pipe(src: WebSocket, dst: WebSocket, label: str):
             try:
                 while True:
                     data = await src.receive_bytes()
+                    print(f"[PIPE {label}] received {len(data)} bytes")
                     await dst.send_bytes(data)
-            except (WebSocketDisconnect, Exception):
-                pass
+            except (WebSocketDisconnect, Exception) as e:
+                print(f"[PIPE {label}] closed: {e}")
 
         await asyncio.gather(
-            pipe(self.sender_ws, self.receiver_ws),
-            pipe(self.receiver_ws, self.sender_ws),
+            pipe(self.sender_ws, self.receiver_ws, "SENDER → RECEIVER"),
+            pipe(self.receiver_ws, self.sender_ws, "RECEIVER → SENDER"),
             return_exceptions=True,
         )
+        print("[PIPE] done")
         self._pipe_done.set()
 
     async def wait_until_done(self, timeout: float = 360.0):
@@ -270,6 +273,7 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
     await websocket.accept()
 
     if role == "sender":
+        print(f"[WS] Sender connected: {session_id}")
         session.attach_sender(websocket)
         try:
             await session.wait_until_ready(timeout=300.0)
@@ -293,6 +297,7 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
         _relay_sessions.pop(session_id, None)
 
     else:  # receiver
+        print(f"[WS] Receiver connected: {session_id}")
         session.attach_receiver(websocket)
         try:
             await session.wait_until_done(timeout=360.0)
