@@ -4,14 +4,10 @@ Dropix Backend  (PostgreSQL edition)
   1. Device Discovery Relay
   2. Transfer Relay (WebSocket proxy)
   3. Push Notifications
-
-Run:
-    cp .env.example .env          # fill in DATABASE_URL
-    pip install -r requirements.txt
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import asyncio
+import json
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -33,9 +29,7 @@ from db import (
     init_db,
 )
 
-# Relay sessions stay in-memory — they're ephemeral, seconds-long, no need to persist
 _relay_sessions: dict[str, "RelaySession"] = {}
-
 _TTL_SECONDS = 120
 
 
@@ -50,7 +44,6 @@ async def lifespan(app: FastAPI):
 
 
 async def _cleanup_loop():
-    """Hard-delete stale room_members rows every 30 s."""
     while True:
         await asyncio.sleep(30)
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=_TTL_SECONDS)
@@ -63,7 +56,7 @@ async def _cleanup_loop():
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Dropix Backend", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Dropix Backend", version="2.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,16 +77,17 @@ class RegisterRequest(BaseModel):
     device_id: str
     device_name: str
     platform: str
-    relay_host: Optional[str] = None
-    relay_port: Optional[int] = None
+    # relay_sessions: dict mapping target_device_id -> session_id
+    # kept as a JSON string in the DB column for backwards compat
+    relay_sessions: Optional[dict[str, str]] = None
 
 
 class DeviceInfo(BaseModel):
     device_id: str
     device_name: str
     platform: str
-    relay_host: Optional[str]
-    relay_port: Optional[int]
+    # session_id for THIS polling device (resolved server-side), or None
+    relay_session_for_me: Optional[str] = None
 
 
 @app.post("/discovery/register", summary="Register device in a room")
@@ -121,16 +115,19 @@ async def register_device(req: RegisterRequest, db: DB):
     member = result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
 
+    # Encode relay_sessions dict as JSON string into relay_host column
+    relay_host_val = json.dumps(req.relay_sessions) if req.relay_sessions else None
+
     if member:
-        member.relay_host = req.relay_host
-        member.relay_port = req.relay_port
+        member.relay_host = relay_host_val
+        member.relay_port = None
         member.last_seen = now
     else:
         db.add(RoomMember(
             room_code=req.room_code,
             device_id=req.device_id,
-            relay_host=req.relay_host,
-            relay_port=req.relay_port,
+            relay_host=relay_host_val,
+            relay_port=None,
             last_seen=now,
         ))
 
@@ -169,16 +166,27 @@ async def list_devices(
         q = q.where(RoomMember.device_id != exclude_id)
 
     rows = (await db.execute(q)).all()
-    return [
-        DeviceInfo(
+
+    result = []
+    for member, device in rows:
+        # Resolve the session ID intended for the polling device (exclude_id)
+        relay_session_for_me: Optional[str] = None
+        if member.relay_host and exclude_id:
+            try:
+                sessions_map: dict = json.loads(member.relay_host)
+                relay_session_for_me = sessions_map.get(exclude_id)
+            except (json.JSONDecodeError, TypeError):
+                # Legacy single-string format fallback
+                relay_session_for_me = member.relay_host
+
+        result.append(DeviceInfo(
             device_id=member.device_id,
             device_name=device.device_name,
             platform=device.platform,
-            relay_host=member.relay_host,
-            relay_port=member.relay_port,
-        )
-        for member, device in rows
-    ]
+            relay_session_for_me=relay_session_for_me,
+        ))
+
+    return result
 
 
 @app.delete("/discovery/leave/{room_code}/{device_id}", summary="Unregister device")
@@ -193,7 +201,7 @@ async def leave_room(room_code: str, device_id: str, db: DB):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. TRANSFER RELAY  (WebSocket proxy — ephemeral, stays in-memory)
+# 2. TRANSFER RELAY  (WebSocket proxy)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RelaySession:
@@ -202,9 +210,7 @@ class RelaySession:
         self.created_at = time.time()
         self.sender_ws: Optional[WebSocket] = None
         self.receiver_ws: Optional[WebSocket] = None
-        # Fired once both sides have attached — only the sender waits on this
         self._both_ready = asyncio.Event()
-        # Fired when the pipe is fully done — receiver waits on this
         self._pipe_done = asyncio.Event()
 
     def attach_sender(self, ws: WebSocket):
@@ -219,12 +225,10 @@ class RelaySession:
         if self.sender_ws is not None and self.receiver_ws is not None:
             self._both_ready.set()
 
-    async def wait_until_ready(self, timeout: float = 60.0):
-        """Wait until both sides are connected. Raises asyncio.TimeoutError on timeout."""
+    async def wait_until_ready(self, timeout: float = 300.0):
         await asyncio.wait_for(self._both_ready.wait(), timeout=timeout)
 
     async def run_pipe(self):
-        """Bidirectional byte pipe. Called once by the sender after both sides ready."""
         async def pipe(src: WebSocket, dst: WebSocket):
             try:
                 while True:
@@ -241,7 +245,6 @@ class RelaySession:
         self._pipe_done.set()
 
     async def wait_until_done(self, timeout: float = 360.0):
-        """Wait for the pipe to finish. Called by the receiver."""
         await asyncio.wait_for(self._pipe_done.wait(), timeout=timeout)
 
 
@@ -268,8 +271,6 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
     if role == "sender":
         session.attach_sender(websocket)
-
-        # Sender owns the pipe: wait for receiver to connect, then run the pipe
         try:
             await session.wait_until_ready(timeout=300.0)
         except asyncio.TimeoutError:
@@ -279,7 +280,6 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
         await session.run_pipe()
 
-        # Mark complete in DB
         async with AsyncSessionLocal() as s:
             result = await s.execute(
                 select(TransferRecord).where(TransferRecord.session_id == session_id)
@@ -294,12 +294,10 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
     else:  # receiver
         session.attach_receiver(websocket)
-
-        # Receiver just waits for the pipe to finish (sender drives it)
         try:
             await session.wait_until_done(timeout=360.0)
         except asyncio.TimeoutError:
-            await websocket.close(code=4008)  # Session expired
+            await websocket.close(code=4008)
         except Exception:
             pass
 
@@ -311,7 +309,7 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 class PushTokenRequest(BaseModel):
     device_id: str
     token: str
-    platform: str   # android | ios
+    platform: str
 
 
 class NotifyRequest(BaseModel):
@@ -321,18 +319,18 @@ class NotifyRequest(BaseModel):
     room_code: str
 
 
-@app.post("/push/register", summary="Register / update push token")
+@app.post("/push/register")
 async def register_push_token(req: PushTokenRequest, db: DB):
     device = await db.get(Device, req.device_id)
     if not device:
-        raise HTTPException(404, "Device not registered — call /discovery/register first")
+        raise HTTPException(404, "Device not registered")
     device.push_token = req.token
     device.push_platform = req.platform
     device.updated_at = datetime.now(timezone.utc)
     return {"status": "registered"}
 
 
-@app.post("/push/notify", summary="Send push notification to a device")
+@app.post("/push/notify")
 async def send_push_notification(req: NotifyRequest, db: DB):
     device = await db.get(Device, req.target_device_id)
     if not device or not device.push_token:
@@ -341,18 +339,12 @@ async def send_push_notification(req: NotifyRequest, db: DB):
     payload = {
         "title": f"📦 Incoming from {req.sender_name}",
         "body": f"{req.file_count} file{'s' if req.file_count != 1 else ''} waiting",
-        "data": {
-            "room_code": req.room_code,
-            "sender_name": req.sender_name,
-            "file_count": req.file_count,
-        },
+        "data": {"room_code": req.room_code, "sender_name": req.sender_name, "file_count": req.file_count},
     }
 
     if device.push_platform == "android":
-        # TODO: firebase_admin.messaging.send(...)
         print(f"[FCM]  → {device.push_token[:20]}… {payload}")
     else:
-        # TODO: httpx APNs request
         print(f"[APNs] → {device.push_token[:20]}… {payload}")
 
     return {"status": "sent", "platform": device.push_platform}
