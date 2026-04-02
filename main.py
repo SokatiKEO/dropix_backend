@@ -77,8 +77,6 @@ class RegisterRequest(BaseModel):
     device_id: str
     device_name: str
     platform: str
-    # relay_sessions: dict mapping target_device_id -> session_id
-    # kept as a JSON string in the DB column for backwards compat
     relay_sessions: Optional[dict[str, str]] = None
 
 
@@ -86,7 +84,6 @@ class DeviceInfo(BaseModel):
     device_id: str
     device_name: str
     platform: str
-    # session_id for THIS polling device (resolved server-side), or None
     relay_session_for_me: Optional[str] = None
 
 
@@ -115,7 +112,6 @@ async def register_device(req: RegisterRequest, db: DB):
     member = result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
 
-    # Encode relay_sessions dict as JSON string into relay_host column
     relay_host_val = json.dumps(req.relay_sessions) if req.relay_sessions else None
 
     if member:
@@ -169,14 +165,12 @@ async def list_devices(
 
     result = []
     for member, device in rows:
-        # Resolve the session ID intended for the polling device (exclude_id)
         relay_session_for_me: Optional[str] = None
         if member.relay_host and exclude_id:
             try:
                 sessions_map: dict = json.loads(member.relay_host)
                 relay_session_for_me = sessions_map.get(exclude_id)
             except (json.JSONDecodeError, TypeError):
-                # Legacy single-string format fallback
                 relay_session_for_me = member.relay_host
 
         result.append(DeviceInfo(
@@ -213,12 +207,22 @@ class RelaySession:
         self._both_ready = asyncio.Event()
         self._pipe_done = asyncio.Event()
 
-    def attach_sender(self, ws: WebSocket):
+        # Transfer metadata — populated when sender/receiver connect
+        self.sender_id: Optional[str] = None
+        self.receiver_id: Optional[str] = None
+        self.file_count: int = 0
+        self.total_bytes: int = 0
+
+    def attach_sender(self, ws: WebSocket, device_id: Optional[str] = None):
         self.sender_ws = ws
+        if device_id:
+            self.sender_id = device_id
         self._check_ready()
 
-    def attach_receiver(self, ws: WebSocket):
+    def attach_receiver(self, ws: WebSocket, device_id: Optional[str] = None):
         self.receiver_ws = ws
+        if device_id:
+            self.receiver_id = device_id
         self._check_ready()
 
     def _check_ready(self):
@@ -230,11 +234,96 @@ class RelaySession:
         await asyncio.wait_for(self._both_ready.wait(), timeout=timeout)
 
     async def run_pipe(self):
+        """
+        Pipe bytes between sender and receiver, counting file_count and
+        total_bytes from the Dropix binary protocol framing.
+
+        Dropix wire format (sender → receiver):
+          4 bytes  magic (0x44 0x52 0x4F 0x50)
+          1 byte   version
+          4 bytes  file_count  (uint32 big-endian)
+          2 bytes  device_name_len
+          N bytes  device_name (UTF-8)
+          for each file:
+            2 bytes  name_len
+            N bytes  name (UTF-8)
+            8 bytes  file_size (uint64 big-endian)
+          ... file data follows ...
+
+        We parse just the header to capture file_count and total_bytes,
+        then forward everything (including the already-read header bytes)
+        to the receiver unchanged.
+        """
+        buf = bytearray()
+
+        async def _read_exactly(ws: WebSocket, n: int) -> bytes:
+            """
+            Pull exactly n bytes, buffering across WebSocket messages.
+            Returns the bytes and leaves any remainder in buf.
+            """
+            nonlocal buf
+            while len(buf) < n:
+                chunk = await ws.receive_bytes()
+                buf.extend(chunk)
+            result = bytes(buf[:n])
+            buf = buf[n:]
+            return result
+
+        # ── Parse header from sender ───────────────────────────────────────
+        try:
+            magic    = await _read_exactly(self.sender_ws, 4)
+            version  = await _read_exactly(self.sender_ws, 1)
+            fc_bytes = await _read_exactly(self.sender_ws, 4)
+            file_count = int.from_bytes(fc_bytes, "big")
+
+            # Skip device name
+            dn_len_bytes = await _read_exactly(self.sender_ws, 2)
+            dn_len = int.from_bytes(dn_len_bytes, "big")
+            dn_bytes = await _read_exactly(self.sender_ws, dn_len)
+
+            total_bytes = 0
+            file_meta_parts = bytearray()
+            for _ in range(file_count):
+                name_len_bytes = await _read_exactly(self.sender_ws, 2)
+                name_len = int.from_bytes(name_len_bytes, "big")
+                name_bytes = await _read_exactly(self.sender_ws, name_len)
+                size_bytes = await _read_exactly(self.sender_ws, 8)
+                file_size = int.from_bytes(size_bytes, "big")
+                total_bytes += file_size
+
+                file_meta_parts += name_len_bytes + name_bytes + size_bytes
+
+            self.file_count = file_count
+            self.total_bytes = total_bytes
+            print(
+                f"[SESSION {self.session_id}] "
+                f"files={file_count}, total_bytes={total_bytes}"
+            )
+
+            # Re-assemble the full header and forward it to the receiver
+            reassembled = (
+                magic
+                + version
+                + fc_bytes
+                + dn_len_bytes
+                + dn_bytes
+                + bytes(file_meta_parts)
+                + bytes(buf)   # any extra bytes already buffered
+            )
+            buf = bytearray()  # reset — everything is in reassembled now
+            await self.receiver_ws.send_bytes(reassembled)
+
+        except Exception as e:
+            print(f"[SESSION {self.session_id}] Header parse error: {e}")
+            self._pipe_done.set()
+            return
+
+        # ── Pipe remaining bytes bidirectionally ───────────────────────────
         async def pipe(src: WebSocket, dst: WebSocket, label: str):
             try:
                 while True:
                     data = await src.receive_bytes()
-                    print(f"[PIPE {label}] received {len(data)} bytes")
+                    print(f"[PIPE {label}] {len(data)} bytes")
                     await dst.send_bytes(data)
             except (WebSocketDisconnect, Exception) as e:
                 print(f"[PIPE {label}] closed: {e}")
@@ -260,7 +349,12 @@ async def create_relay_session(db: DB):
 
 
 @app.websocket("/relay/ws/{session_id}/{role}")
-async def relay_ws(websocket: WebSocket, session_id: str, role: str):
+async def relay_ws(
+    websocket: WebSocket,
+    session_id: str,
+    role: str,
+    device_id: Optional[str] = None,   # e.g. ?device_id=<uuid>
+):
     if role not in ("sender", "receiver"):
         await websocket.close(code=4000)
         return
@@ -273,8 +367,8 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
     await websocket.accept()
 
     if role == "sender":
-        print(f"[WS] Sender connected: {session_id}")
-        session.attach_sender(websocket)
+        print(f"[WS] Sender connected: {session_id} (device_id={device_id})")
+        session.attach_sender(websocket, device_id)
         try:
             await session.wait_until_ready(timeout=300.0)
         except asyncio.TimeoutError:
@@ -284,21 +378,26 @@ async def relay_ws(websocket: WebSocket, session_id: str, role: str):
 
         await session.run_pipe()
 
+        # Update the transfer record with full metadata
         async with AsyncSessionLocal() as s:
             result = await s.execute(
                 select(TransferRecord).where(TransferRecord.session_id == session_id)
             )
             record = result.scalar_one_or_none()
             if record:
-                record.success = True
-                record.ended_at = datetime.now(timezone.utc)
+                record.success     = True
+                record.ended_at    = datetime.now(timezone.utc)
+                record.sender_id   = session.sender_id
+                record.receiver_id = session.receiver_id
+                record.file_count  = session.file_count
+                record.total_bytes = session.total_bytes
             await s.commit()
 
         _relay_sessions.pop(session_id, None)
 
     else:  # receiver
-        print(f"[WS] Receiver connected: {session_id}")
-        session.attach_receiver(websocket)
+        print(f"[WS] Receiver connected: {session_id} (device_id={device_id})")
+        session.attach_receiver(websocket, device_id)
         try:
             await session.wait_until_done(timeout=360.0)
         except asyncio.TimeoutError:
